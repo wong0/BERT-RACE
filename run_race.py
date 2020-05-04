@@ -13,6 +13,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# modified by Charles CHIN due to updated apex package
+
 """BERT finetuning runner."""
 
 import logging
@@ -24,6 +27,7 @@ import csv
 import glob 
 import json
 import apex
+from apex import amp
 
 import numpy as np
 import torch
@@ -384,8 +388,6 @@ def main():
     model = BertForMultipleChoice.from_pretrained(args.bert_model,
         cache_dir=PYTORCH_PRETRAINED_BERT_CACHE / 'distributed_{}'.format(args.local_rank),
         num_choices=4)
-    if args.fp16:
-        model.half()
     model.to(device)
     if args.local_rank != -1:
         try:
@@ -414,19 +416,14 @@ def main():
         t_total = t_total // torch.distributed.get_world_size()
     if args.fp16:
         try:
-            from apex.optimizers import FP16_Optimizer
             from apex.optimizers import FusedAdam
         except ImportError:
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
 
-        optimizer = FusedAdam(optimizer_grouped_parameters,
-                              lr=args.learning_rate,
-                              bias_correction=False,
-                              max_grad_norm=1.0)
-        if args.loss_scale == 0:
-            optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
-        else:
-            optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_scale)
+        optimizer = FusedAdam(model.parameters())
+        opt_level = 'O2'
+        model, optimizer = amp.initialize(model, optimizer,  opt_level=opt_level)
+        
     else:
         optimizer = BertAdam(optimizer_grouped_parameters,
                              lr=args.learning_rate,
@@ -457,10 +454,13 @@ def main():
             tr_loss = 0
             nb_tr_examples, nb_tr_steps = 0, 0
             logger.info("Trianing Epoch: {}/{}".format(ep+1, int(args.num_train_epochs)))
+            optimizer.zero_grad()  
             for step, batch in enumerate(train_dataloader):
                 batch = tuple(t.to(device) for t in batch)
                 input_ids, input_mask, segment_ids, label_ids = batch
                 loss = model(input_ids, segment_ids, input_mask, label_ids)
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
                 if n_gpu > 1:
                     loss = loss.mean() # mean() to average on multi-gpu.
                 if args.fp16 and args.loss_scale != 1.0:
@@ -473,10 +473,6 @@ def main():
                 nb_tr_examples += input_ids.size(0)
                 nb_tr_steps += 1
 
-                if args.fp16:
-                    optimizer.backward(loss)
-                else:
-                    loss.backward()
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     # modify learning rate with special warm up BERT uses
                     lr_this_step = args.learning_rate * warmup_linear(global_step/t_total, args.warmup_proportion)
