@@ -342,6 +342,8 @@ def main():
 
     args = parser.parse_args()
 
+    # choose device for training
+    # Either no gpu, or 1 gpu
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
         n_gpu = torch.cuda.device_count()
@@ -360,23 +362,35 @@ def main():
 
     args.train_batch_size = int(args.train_batch_size / args.gradient_accumulation_steps)
 
+    # args.seed is just a random seem for initization
+    # np.random.seed(0) makes the random numbers predictable. With the seed reset (every time), the same set of numbers will appear every time.
+    # Use random.seed() to initialize the pseudo-random number generator.
     random.seed(args.seed)
     np.random.seed(args.seed)
+
+    # It will set the seed of the random number generator to a fixed value, 
+    # so that when you call for example torch.rand(2), the results will be reproducible.
     torch.manual_seed(args.seed)
     if n_gpu > 0:
-        torch.cuda.manual_seed_all(args.seed)
-
+        torch.cuda.manual_seed_all(args.seed) # Sets the seed for generating random numbers on all GPUs. It’s safe to call this function if CUDA is not available; in that case, it is silently ignored.
+    
+    # if not run training and run eval
     if not args.do_train and not args.do_eval:
         raise ValueError("At least one of `do_train` or `do_eval` must be True.")
 
+    # if path exists and returns a list containing the names of the entries in the directory given by path
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir):
         raise ValueError("Output directory ({}) already exists and is not empty.".format(args.output_dir))
+    # Recursive directory creation function.
+    # Like mkdir(), but makes all intermediate-level directories needed to contain the leaf directory.
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Instantiate pretrained pytorch model from pre-trained model configuration.
     tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
 
     train_examples = None
     num_train_steps = None
+    # if do run training
     if args.do_train:
         train_dir = os.path.join(args.data_dir, 'train')
         train_examples = read_race_examples([train_dir+'/high', train_dir+'/middle'])
@@ -385,6 +399,8 @@ def main():
             len(train_examples) / args.train_batch_size / args.gradient_accumulation_steps * args.num_train_epochs)
 
     # Prepare model
+
+    # Instantiate a pretrained pytorch model from a pre-trained model configuration.
     model = BertForMultipleChoice.from_pretrained(args.bert_model,
         cache_dir=PYTORCH_PRETRAINED_BERT_CACHE / 'distributed_{}'.format(args.local_rank),
         num_choices=4)
@@ -407,24 +423,37 @@ def main():
     param_optimizer = [n for n in param_optimizer if 'pooler' not in n[0]]
 
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+
+    # Add Optimizer Grouped Parameters
     optimizer_grouped_parameters = [
         {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
         {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
         ]
+
+    # 
     t_total = num_train_steps
     if args.local_rank != -1:
         t_total = t_total // torch.distributed.get_world_size()
+
+    # Use 16-bit float precision
     if args.fp16:
         try:
             from apex.optimizers import FusedAdam
         except ImportError:
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
 
+        # Implements Adam algorithm.
+        # Currently GPU-only.
         optimizer = FusedAdam(model.parameters())
         opt_level = 'O2'
+
+        # amp.initialize’s optimizer argument may be a single optimizer or a list of optimizers, 
+        # as long as the output you accept has the same type.
+        # https://nvidia.github.io/apex/advanced.html
         model, optimizer = amp.initialize(model, optimizer,  opt_level=opt_level)
         
     else:
+        # Previously BertAdam optimizer was instantiated like this:
         optimizer = BertAdam(optimizer_grouped_parameters,
                              lr=args.learning_rate,
                              warmup=args.warmup_proportion,
@@ -432,17 +461,23 @@ def main():
 
     global_step = 0
     if args.do_train:
+        # Converts a set of InputExamples to a list of InputFeatures.
+        # eg. convert_examples_to_features(examples, label_list, max_seq_length, tokenizer)
         train_features = convert_examples_to_features(
             train_examples, tokenizer, args.max_seq_length, True)
+        
         logger.info("***** Running training *****")
         logger.info("  Num examples = %d", len(train_examples))
         logger.info("  Batch size = %d", args.train_batch_size)
         logger.info("  Num steps = %d", num_train_steps)
+        
         all_input_ids = torch.tensor(select_field(train_features, 'input_ids'), dtype=torch.long)
         all_input_mask = torch.tensor(select_field(train_features, 'input_mask'), dtype=torch.long)
         all_segment_ids = torch.tensor(select_field(train_features, 'segment_ids'), dtype=torch.long)
         all_label = torch.tensor([f.label for f in train_features], dtype=torch.long)
+        
         train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label)
+        
         if args.local_rank == -1:
             train_sampler = RandomSampler(train_data)
         else:
@@ -564,8 +599,9 @@ def main():
         test_high = [test_dir + '/high']
         test_middle = [test_dir + '/middle']
 
-        ## test high 
+        # test high 
         eval_examples = read_race_examples(test_high)
+        # 
         eval_features = convert_examples_to_features(
             eval_examples, tokenizer, args.max_seq_length, True)
         logger.info("***** Running evaluation: test high *****")
